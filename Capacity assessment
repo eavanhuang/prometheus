@@ -1,0 +1,133 @@
+import numpy as np
+import json
+import os
+import time
+import datetime
+import pandas as pd
+import requests
+import seaborn as sns
+import base_data as bd
+import tsne
+import data_api as da
+from matplotlib import pylab as plt
+
+from sklearn.tree import DecisionTreeRegressor
+from sklearn import linear_model
+from sklearn.linear_model import Perceptron
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import IsolationForest
+
+
+
+# query data
+def query(start1,end1,coloumn,prom_url="http://10.113.69.191:5901"):
+    if(coloumn =='cpu'):
+        query_str_cpu="sum(rate(container_cpu_usage_seconds_total{image!='',namespace='bsf-bsf-1',container_name!='POD'}[1m]))"
+        df = query_prometheus(query_str_cpu,start1,end1,'cpu',time_str,14,prom_url)
+    if(coloumn =='memory'):
+        query_str_mem="sum(container_memory_usage_bytes{image!='',namespace='bsf-bsf-1'})"
+        df = query_prometheus(query_str_mem,start1,end1,'memory',time_str,14,prom_url)
+    if(coloumn =='disk'):
+        query_str_disk="sum(container_fs_usage_bytes{namespace='bsf-bsf-1',container_name!=''})"
+        df = query_prometheus(query_str_disk,start1,end1,'disk',time_str,14,prom_url)    
+    if(coloumn =='network_receive'):
+        query_str_network_receive="sum(irate(container_network_receive_bytes_total{device!='lo',namespace='bsf-bsf-1'}[1m]))"
+        df = query_prometheus(query_str_network_receive,start1,end1,'network_receive',time_str,14,prom_url)
+    if(coloumn =='network_transmit'):
+        query_str_network_transmit="sum(irate(container_network_transmit_bytes_total{device!='lo',namespace='bsf-bsf-1'}[1m]))"
+        df = query_prometheus(query_str_network_transmit,start1,end1,'network_transmit',time_str,14,prom_url)
+    if(coloumn =='cpu_api'):
+        query_str_cpu="sum(rate(container_cpu_usage_seconds_total{image!='',namespace='bsf-bsf-1',container_name='api-gateway'}[1m]))"
+        df = query_prometheus(query_str_cpu,start1,end1,'cpu_api',time_str,14,prom_url)
+    if(coloumn =='disk_api'):
+        query_str_disk="sum(container_fs_usage_bytes{namespace='bsf-bsf-1',container_name='api-gateway'})"
+        df = query_prometheus(query_str_disk,start1,end1,'disk_api',time_str,14,prom_url)      
+    if(coloumn =='memory_api'):
+        query_str_mem="sum(container_memory_usage_bytes{image!='',namespace='bsf-bsf-1',container_name='api-gateway'})"
+        df = query_prometheus(query_str_mem,start1,end1,'memory_api',time_str,14,prom_url)
+    query_str_tps="sum (rate(http_server_requests_seconds_count{kubernetes_namespace='bsf-bsf-1'}[20s]))"
+    df_tps=query_prometheus(query_str_tps,start1,end1,'tps',time_str,14,prom_url)
+    df = pd.merge(df_tps,df, how = 'inner', on = 'tk')
+    apply_float(df)
+    return df
+
+def apply_float(df):
+    columns = df.columns
+    for column in columns:
+        df[column] = df[column].map(lambda x:float(x))
+    return df
+
+   
+def result_to_csv(results, column, time_str):
+    df = pd.DataFrame(results)
+    df.columns = ['tk',column]
+    df.to_csv('../data/'+column+'_'+time_str+'.csv')
+    return df
+   
+# query from prometheus API.
+
+def query_prometheus(query_str, start, end, column, time_str, step ,prom_url):
+    print(column+" loading")
+    req_url = '{0}/api/v1/query_range'.format(prom_url)
+    response = requests.get(req_url, params={'query': query_str,"start": start,"end": end,"step":step})
+    results = response.json()
+    #print(results.keys())
+    try:
+        results = results['data']['result'][0]['values']
+        print("done")
+    except:
+        print("get data error")
+        print("the result is following:")
+        print(results)
+        if results['data']['result']==[]:
+            print("No data in this time range or some other data questions\n")
+    return result_to_csv(results, column, time_str)
+
+
+# get the relationship between tps and column
+def step(df, tps_range, column, time_str="temp", rate=0.1):
+    df_temp = df[['tps',column]][(tps_range[0]<df['tps']) & (df['tps']<tps_range[1])]
+    if df[column].mean()>pow(10,6):
+        df_temp[column] = df_temp[column].map(lambda x:x/pow(1024,3))
+    # Iforest filter the outlier
+    rng = np.random.RandomState(42)
+    clf = IsolationForest(max_samples=100, random_state=rng, contamination=rate)
+    clf.fit(df_temp)
+    y_pred_train = clf.predict(df_temp)
+    df_temp.index = range(len(df_temp))
+    df_index = df_temp.index
+    for i in range(len(y_pred_train)):
+        if y_pred_train[i] == -1:
+            df_temp = df_temp.drop(index=df_index[i])
+
+    # linear regression
+    Train_x, Train_y = da.reshape_data(df_temp, column)
+    lr = linear_model.LinearRegression()
+    lr.fit(Train_x,Train_y)
+    pre_x = np.array(range(int(max(Train_x)))).reshape(-1,1)
+    pre_y = lr.predict(pre_x)
+
+    # caculate the slope
+    slope = 1/(pre_y[1]-pre_y[0])
+    plt.figure(figsize=(20,6))
+    plt.scatter(Train_x, Train_y)
+    plt.xlabel("TPS")
+    plt.ylabel(column.upper())
+    plt.plot(pre_x,pre_y)
+    print("TPS/"+column.upper()+":",slope[0])
+    print("when tps=2500,predict "+ column.upper() +"=%.2f" % lr.predict([[2500]]))
+# query time
+start1 = '2019/7/9 12:55:0'
+end1 = '2019/7/9 14:44:0'
+time_str = start1+"~"+end1
+time_str = time_str.replace('/','-')
+start1, end1, time_str = da.start_end(start1,end1)
+
+
+df=query(start1,end1,'cpu')
+df_temp = step(df,[0,df['tps'].max()],'cpu',time_str)
+
+
+
