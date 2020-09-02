@@ -1,0 +1,350 @@
+import os, math
+import json
+import re
+import time
+import datetime
+import threading
+#import httplib, urllib
+import socket
+import csv
+import pandas as pd
+import requests
+from prometheus_client import Gauge, generate_latest
+
+import numpy as np
+import requests
+import logging
+
+from flask import Flask, Response, request, render_template
+app = Flask(__name__)
+count = 0
+hostname = "dbclient"
+default_prom_url = "http://10.113.69.191:5901"
+req_url = '{0}/api/v1/query_range'.format(default_prom_url)
+#columns = ['memory','pod','cpu','tps','network_receive','network_transmit','disk_written','disk_io']
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@app.route('/')
+def show_usage():
+    usage = """
+Path  ==> Description
+/         usage
+/hello    Healthy check, report query count
+/csv	  Show resource usage in table
+/load	  show load and capacity
+/metrics  Prometheus metrics data interface
+/data	  Show test result
+/query	  Show resource usage of a given kubernetes namespace
+/json	  return resource usage in json format
+/pydb	  Run python scripts to simulate sysbench db test with various thread numbers
+/pyperf	  Run python script test for cpu,mem,threads,mutex,disk, udp,etc
+/cmd      Run a remote command
+"""
+    return "<code>"+'\n<br>'.join(usage.split("\n"))+"</code>",200
+
+@app.route('/hello')
+def hello():
+    global count
+    version = os.environ.get('SERVICE_VERSION')
+    count = count + 1
+    return 'Hello version: %s, instance: %s, count %d\n' % (version, os.environ.get('HOSTNAME'), count),200
+
+@app.route('/health')
+def health():
+    return 'Helloworld is healthy', 200
+
+# define the gauge
+# Gauge(name, describe information, labels)
+load_labels = ["column", "namespace","service"] #,"cpu_used","cpu_requested","cpu_limits","pods"]
+#load_gauge = Gauge("nf_load_info","service load info", load_labels)
+#test_gauge = Gauge("test_info","test info", ["test"])
+mutation_gauge = Gauge("mutation_info","service mutation info", load_labels)
+#mutation_gauge = Gauge("mutation_info","service mutation info", ["column"])
+namespace='perf201901-pcf'
+
+@app.route("/metrics")
+def handle_metrics():
+    global mutation_gauge
+    # requests_total.inc(2)
+    return Response(generate_latest(mutation_gauge), mimetype="text/plain")
+
+
+
+global query_config
+query_config = [
+    {
+        "type":"net_write_by_pod",
+        "query": "sum (rate (container_network_transmit_bytes_total{image!='',name=~'^k8s_.*'}[1m])) by (pod_name)",
+         "field":"pod_name",
+         "filter":8388608
+    },
+    {
+        "type":"net_write_by_host",
+        "query": "sum (rate (container_network_transmit_bytes_total{image!='',name=~'^k8s_.*'}[1m])) by (instance)",
+         "field":"instance",
+         "filter":8388608
+    },
+    {
+        "type":"cpu",
+        "query": "sum(rate(container_cpu_usage_seconds_total{image!='',container_name!='POD'}[20s])) by (container_name)",
+         "field":"container_name",
+         "filter":1
+    },
+   
+    {
+        "type":"node_disk",
+        "query": "sum by (kubernetes_node) (irate(node_disk_written_bytes_total[1m]))",
+         "field":"kubernetes_node",
+         "filter":8388608
+    },
+    {
+        "type":"pod",
+        "query":"count(container_memory_usage_bytes{image!=''}) by (container_name)",
+        "field":"container_name",
+        "filter":8388608
+    },
+    {
+        "type":"memory",
+        "query": "sum by (container_name)(container_memory_usage_bytes{image!=''})",
+        "field":"container_name",
+        "filter":8388608
+    },
+    {
+        "type":"kpi",
+        "query":"sum (rate(requests_total{kubernetes_namespace!=''}[20s])) by (instance)",
+        "field":"instance",
+        "filter":100
+    }
+    # container_fs_usage_bytes  service_disk,
+    #  KPI : TPS
+]
+
+def update_mutation():
+    global query_config
+    global mutation_gauge
+   
+    now_end = time.time()
+    now_start = now_end-70
+    before_end = now_end-70
+    before_start = now_start-70
+    for config in query_config:
+        temp_type = config['type']
+        query_str = config['query']
+        field = config['field']
+        try:
+            df_now=query_service_res("now", namespace, query_str, now_start,now_end, field)
+            df_before=query_service_res("before", namespace, query_str, before_start, before_end, field)
+            mutation= 100* (df_now["now"] - df_before["before"]) / (df_before["before"] + config['filter'])
+            df=mutation
+            service=df._stat_axis.values.tolist()
+            for s in service :
+                mutation_gauge.labels(namespace=namespace, column=temp_type, service=s).set(df[s])      
+        except:
+            mutation_gauge.labels(namespace=namespace, column=temp_type, service='no_data').set(0)
+            #mutation=pd.DataFrame({temp_type:[0]},index = ['no_data'])
+           
+       
+
+# query from prometheus and return sum of windows
+def query_service_res(key, namespace, query_str,start_tk,end_tk, field):
+    info = {}
+    logger.info("Query:" + req_url)
+    response = requests.get(req_url, params={'query': query_str,"start": start_tk,"end": end_tk,"step":14})
+    logger.info(response)
+    results = response.json()
+    ret = results['data']['result']
+    for r in ret:
+        if len(r['metric'].keys())<1:
+            logger.warning("Error:" + str(r))
+            continue
+        df = pd.DataFrame(r['values'])
+        df.columns = ["tk","column"]
+        df["column"] = df["column"].map(lambda x:float(x))
+       
+        svc = r['metric'][field]
+        if svc not in info.keys():
+            info[svc] = {}
+        info[svc][key] = df["column"].sum()
+    return pd.DataFrame.from_dict(info,orient='index')
+
+exit_flag = 0
+exec_count = 0
+def ontimer():
+    global exec_count,exit_flag,hostname
+    pd.options.display.float_format = '{:,.1f}'.format
+    logger.info(time.strftime('Timer : %Y-%m-%d %H:%M:%S') + str(exec_count))
+    exec_count += 1
+    if exit_flag == 0:
+      threading.Timer(10, ontimer).start()
+    #update()
+    update_mutation()
+
+if __name__ == "__main__":
+    hostname = socket.gethostname()
+    ontimer()
+    #app.run(host='0.0.0.0', port=8000, threaded=True)
+    app.run(host='0.0.0.0', debug=True, port=5808, threaded=True, use_reloader=False)
+   
+"""
+# get the mutation rate from columns(pod,memory)
+def mutation_rate():
+    now_end = time.time()
+    now_start = now_end-70
+    before_end = now_end-10
+    before_start = now_start-10
+    data_now = query(now_start, now_end,namespace)
+    data_before = query(before_start, before_end,namespace)
+    result = np.ones(len(columns))
+    for i in range(len(result)):
+        result[i] = data_now[i].sum()/data_before[i].sum()
+    return result
+
+# query the memory data from prometheus
+def query(start_tk, end_tk, namespace):
+    #print("start query")
+    query_str_memory = "sum(container_memory_usage_bytes{image!='',namespace='%s'})"%(namespace)
+    query_str_pod = "count(container_memory_usage_bytes{container_name='pcf-smservice',namespace='%s'})"%(namespace)
+    query_str_cpu = "sum(rate(container_cpu_usage_seconds_total{image!='',namespace='%s',container_name!='POD'}[20s]))"%(namespace)
+    query_str_tps = "sum(rate(requests_total{kubernetes_namespace='%s'}[20s]))"%(namespace)
+    query_str_network_receive = "irate(node_network_receive_bytes_total{device!='lo'}[1m])"
+    query_str_network_transmit = "irate(node_network_transmit_bytes_total{device!='lo'}[1m])"
+    query_str_disk_written = "sum(irate(node_disk_written_bytes_total[1m]))"
+    query_str_disk_io = "sum(irate(node_disk_io_time_seconds_total[1m]))"
+    query_str_dic = [[query_str_memory,'memory'],[query_str_pod,'pod'],[query_str_cpu,'cpu'],[query_str_tps,'tps'],
+                    [query_str_network_receive,'network_receive'],[query_str_network_transmit,'network_transmit'],
+                    [query_str_disk_written,'disk_written'],[query_str_disk_io,'disk_io']]
+    result_array = []
+    for query_str,column in query_str_dic:
+        response = requests.get(req_url, params={'query': query_str,"start": start_tk,"end": end_tk,"step":14})
+        #print(response)
+        results = response.json()
+        #print(results)
+        try:
+            data = results['data']['result'][0]['values']
+            df = pd.DataFrame(data)
+            df.columns = ["tk",column]
+            df[column] = df[column].map(lambda x:float(x))
+            array = df[column].values
+            result_array.append(array)
+        except:
+            print("get data from "+column+" error")
+            array = np.ones(6)
+            result_array.append(array)
+    return np.array(result_array)
+
+
+# update the data to gauge
+def update():
+    global service_info
+    #global test_gauge
+    global mutation_gauge
+
+    #test_gauge.labels("test").set(3000)
+    #pod_rate ,memory_rate = mutation_rate()
+    temp_rate = mutation_rate()
+    for i in range(len(columns)):
+       
+        mutation_gauge.labels(namespace=namespace,column=columns[i]).set(temp_rate[i])
+"""
+
+"""
+columns = ["memory","cpu","pod","disk_io"]
+global service
+global network_pod
+global instance
+service = []
+network_pod = []
+instance = []
+
+
+def query():
+    global instance
+    column = "memory"
+    now_end = time.time()
+    before_end = now_end-70
+   
+    query_str_memory = "sum by (container_name)(container_memory_usage_bytes{image!=''})"
+    query_str_cpu = "sum(rate(container_cpu_usage_seconds_total{image!='',container_name!='POD'}[20s])) by (container_name)"
+    query_str_pod = "count(container_memory_usage_bytes{image!=''}) by (container_name)"
+    query_str_disk_io = "sum by (container_name ) (container_fs_usage_bytes{container_name!=''})"
+    query_str_tps = "sum (rate(requests_total{kubernetes_namespace!=''}[20s])) by (instance)"
+    query_str_network = "sum (rate (container_network_transmit_bytes_total{image!='',name=~'^k8s_.*'}[1m])) by (pod_name)"
+
+    query_str_list = [query_str_memory,query_str_pod,query_str_cpu,query_str_disk_io]
+    df_list = []
+    for i in range(len(query_str_list)):
+        df_list.append(mutation_rate(query_str_list[i], now_end, before_end,columns[i],"container_name"))
+    df = df_list[0]
+    for i in range(len(query_str_list)-1):
+        df = pd.merge(df,df_list[i+1], left_index=True, right_index=True, how='outer')
+   
+    df_network = mutation_rate(query_str_network, now_end, before_end, 'network', field="pod_name")
+    try:
+        df_tps = mutation_rate(query_str_tps, now_end, before_end, 'tps', field="instance")
+    except:
+        instance = ['no_data']
+        df_tps = pd.DataFrame({'tps':[0]},index = instance)
+    return df, df_network, df_tps
+
+
+# caculate the mutation rate
+def mutation_rate(query_str, now_end, before_end, column, field="container_name"):
+    global service
+    global info
+    global network_pod
+    global instance
+    now_start = now_end-70
+    before_start = now_start-10
+    info_now = query_service_res("now", namespace, query_str,now_start,now_end,field)
+    info_before = query_service_res("before", namespace, query_str,before_start,before_end,field)
+
+    mutation=info_now['now']/info_before['before']
+    df = pd.DataFrame()
+    df[column]=mutation
+    df.dropna(inplace=True)
+    #if len(service) < len(df._stat_axis.values.tolist()) and field == "container_name":
+    if field == "container_name":
+        service=df._stat_axis.values.tolist()
+    elif field == "pod_name":
+        network_pod = df._stat_axis.values.tolist()
+    elif field == "instance":
+        instance = df._stat_axis.values.tolist()
+       
+    #update
+    return(pd.DataFrame(df[column]))  
+"""
+
+"""
+# update the data to gauge
+def update():
+    global service
+    global service_info
+    global network_pod
+    all_service_info ={}
+    global mutation_gauge
+
+    mutation_rate, network, tps = query()
+    #print(tps)
+    for s in service:
+        for c in columns:
+            mutation_gauge.labels(namespace=namespace,column=c,service=s).set(mutation_rate.loc[s][c])
+
+    for pod in network_pod:
+        #print(pod)
+        mutation_gauge.labels(namespace=namespace,column="network",service=pod).set(network.loc[pod]['network'])
+   
+    for ins in instance:
+        #print(ins)
+        mutation_gauge.labels(namespace=namespace,column="tps",service=ins).set(tps.loc[ins]['tps'])
+   
+"""        
+   
+   
+
+
+""":cmd:
+example sysbench command to quick evaluate mysql-cluster performance :
+sysbench  --test=oltp --db-driver=mysql --mysql-port=3309 --mysql-host=10.113.69.167   --mysql-user=pcf --mysql-password=pcf  --oltp-table-size=800000  --mysql-engine-trx=no --oltp-test-mode=nontrx  --oltp-nontrx-mode=update_key   --mysql-table-engine=ndbcluster --max-requests=800000 --num-threads=32  run
+"""
